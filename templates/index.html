@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tra cứu mã số thuế hàng loạt</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --border: #e2e5ea;
+    --text: #1f2430;
+    --muted: #6b7280;
+    --accent: #1a7f37;
+    --accent-dark: #146029;
+    --ok: #1a7f37;
+    --warn: #b45309;
+    --err: #b91c1c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px 16px 60px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 14px; }
+  .drop {
+    border: 2px dashed var(--border);
+    border-radius: 8px;
+    padding: 28px;
+    text-align: center;
+    color: var(--muted);
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .drop.drag { border-color: var(--accent); background: #eaf6ee; }
+  .drop input { display: none; }
+  .btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 10px 18px;
+    border-radius: 6px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .btn:hover { background: var(--accent-dark); }
+  .btn:disabled { background: #cbd0d8; cursor: not-allowed; }
+  .btn.secondary {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn.secondary:hover { background: #f0f1f3; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  select, input[type=number] {
+    width: 100%;
+    padding: 7px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    background: #fff;
+  }
+  table.preview {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 12px;
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  table.preview th, table.preview td {
+    border: 1px solid var(--border);
+    padding: 4px 8px;
+    text-align: left;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  table.preview th { background: #f0f1f3; position: sticky; top: 0; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .row-actions { margin-top: 18px; display: flex; gap: 10px; align-items: center; }
+  #status { font-size: 13px; color: var(--muted); }
+  .hidden { display: none !important; }
+  .summary-pill {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    margin-right: 8px;
+  }
+  .pill-ok { background: #e6f4ea; color: var(--ok); }
+  .pill-warn { background: #fef3e2; color: var(--warn); }
+  .pill-err { background: #fdecea; color: var(--err); }
+  .log-row-ok { color: var(--ok); }
+  .log-row-not_found { color: var(--warn); }
+  .log-row-error { color: var(--err); }
+  #logBox {
+    max-height: 260px;
+    overflow-y: auto;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #fafafa;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+  }
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid #ddd;
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .step-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: var(--ok);
+    color: #fff;
+    font-size: 12px;
+    margin-right: 8px;
+  }
+  .progress-track {
+    height: 8px;
+    background: #e9ece9;
+    border-radius: 999px;
+    overflow: hidden;
+    margin-bottom: 6px;
+  }
+  .progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--ok);
+    border-radius: 999px;
+    transition: width .3s ease;
+  }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+  }
+  .stat-tile {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 10px;
+    text-align: center;
+    background: #fafbfa;
+  }
+  .stat-num { font-size: 26px; font-weight: 700; line-height: 1.2; }
+  .stat-ok { color: var(--ok); }
+  .stat-warn { color: var(--warn); }
+  .stat-err { color: var(--err); }
+  .stat-muted { color: var(--muted); }
+  .stat-label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  .progress-table-wrap {
+    max-height: 420px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  table.progress-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.progress-tbl thead th {
+    position: sticky; top: 0;
+    background: var(--ok);
+    color: #fff;
+    text-align: left;
+    padding: 8px 10px;
+    font-weight: 600;
+  }
+  table.progress-tbl td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .col-chip {
+    display: inline-block;
+    background: rgba(255,255,255,.25);
+    border-radius: 4px;
+    padding: 0 5px;
+    font-size: 11px;
+    margin-right: 5px;
+  }
+  .result-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .badge-ok { background: #e6f4ea; color: var(--ok); }
+  .badge-warn { background: #fef3e2; color: var(--warn); }
+  .badge-err { background: #fdecea; color: var(--err); }
+  .badge-muted { background: #eef0f2; color: var(--muted); }
+  .badge-wait { background: #eef2fb; color: #3151b7; }
+  tr.row-active { background: #fdf9ee; }
+
+  .brand-row { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
+  .logo-badge {
+    width: 34px; height: 34px;
+    border-radius: 9px;
+    background: var(--accent);
+    color: #fff;
+    font-weight: 700;
+    font-size: 12px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .brand-text {
+    font-size: 12px;
+    letter-spacing: .06em;
+    color: var(--muted);
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .brand-text .dot { margin: 0 6px; opacity: .6; }
+
+  .step-title {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 15px; font-weight: 600;
+    margin-bottom: 14px;
+  }
+  .step-circle {
+    width: 24px; height: 24px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .drop-icon { font-size: 34px; margin-bottom: 10px; }
+  .drop-main { font-weight: 600; font-size: 15px; color: var(--text); margin-bottom: 4px; }
+  .drop-main .drop-or { font-weight: 400; color: var(--muted); }
+  .drop-sub { font-size: 12px; color: var(--muted); }
+  .footnote { text-align: center; font-size: 12px; color: var(--muted); margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand-row">
+    <div class="logo-badge">MST</div>
+    <div class="brand-text">VNTAX <span class="dot">·</span> CÔNG CỤ VĂN PHÒNG</div>
+    {% if show_logout %}
+    <a href="/logout" style="margin-left:auto; font-size:12px; color:var(--muted);">Đăng xuất</a>
+    {% endif %}
+  </div>
+
+  <h1>Tra cứu mã số thuế hàng loạt</h1>
+  <p class="subtitle">
+    Tải file Excel lên, công cụ sẽ <b>tự nhận diện cột chứa mã số thuế</b> trong file của bạn,
+    tra cứu qua API xinvoice và điền <b>Tên người nộp thuế · Địa chỉ · Cơ quan thuế · Trạng thái</b>
+    vào các cột tương ứng, giữ nguyên dữ liệu và định dạng gốc của bạn.
+  </p>
+
+  <div class="card" id="uploadCard">
+    <div class="step-title"><span class="step-circle">1</span>Chọn file Excel (.xlsx)</div>
+    <div class="drop" id="dropZone">
+      <div class="drop-icon">📁</div>
+      <div class="drop-main"><b>Kéo thả file vào đây</b> <span class="drop-or">hoặc bấm để chọn file</span></div>
+      <div class="drop-sub">Chỉ hỗ trợ định dạng .xlsx · Dữ liệu xử lý ngay trên máy bạn, không tải file lên nơi khác</div>
+      <input type="file" id="fileInput" accept=".xlsx,.xlsm">
+    </div>
+    <div class="hint" id="uploadStatus"></div>
+    <div class="footnote">Dữ liệu tra cứu từ api.xinvoice.vn · Công cụ chạy hoàn toàn trên máy tính của bạn</div>
+  </div>
+
+  <div class="card hidden" id="mappingCard">
+    <div class="step-title"><span class="step-circle">2</span>Kiểm tra & chỉnh cột (nếu cần)</div>
+
+    <div class="grid" style="margin-bottom:16px;">
+      <div>
+        <label>Sheet</label>
+        <select id="sheetSelect"></select>
+      </div>
+      <div>
+        <label>Dòng dữ liệu bắt đầu từ</label>
+        <input type="number" id="startRow" min="1" value="3">
+      </div>
+      <div>
+        <label>Giãn cách giữa các lần gọi API (giây)</label>
+        <input type="number" id="delay" min="0" max="10" step="0.1" value="1.0">
+      </div>
+      <div style="display:flex; align-items:flex-end;">
+        <label style="display:flex; align-items:center; gap:6px; margin-bottom:7px; cursor:pointer;">
+          <input type="checkbox" id="skipFilled" checked style="width:auto;">
+          <span>Bỏ qua dòng đã có đủ dữ liệu</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-bottom:16px;">
+      <div>
+        <label>Cột chứa Mã số thuế</label>
+        <select id="mstCol"></select>
+      </div>
+      <div>
+        <label>Cột điền Tên người nộp thuế</label>
+        <select id="nameCol"></select>
+      </div>
+      <div>
+        <label>Cột điền Địa chỉ</label>
+        <select id="addressCol"></select>
+      </div>
+      <div>
+        <label>Cột điền Cơ quan quản lý thuế</label>
+        <select id="deptCol"></select>
+      </div>
+      <div>
+        <label>Cột điền Trạng thái MST</label>
+        <select id="statusCol"></select>
+      </div>
+    </div>
+
+    <div class="hint" style="margin-bottom:8px;">
+      Xem trước dữ liệu (tối đa 12 dòng đầu, 12 cột đầu) — dòng tiêu đề tôi đoán được tô đậm hàng đầu bảng:
+    </div>
+    <table class="preview" id="previewTable"></table>
+
+    <div class="row-actions">
+      <button class="btn" id="runBtn">Bắt đầu tra cứu</button>
+      <span id="status"></span>
+    </div>
+  </div>
+
+  <div class="card hidden" id="progressCard">
+    <h2 id="progressTitle">
+      <span class="step-badge">3</span>
+      <span id="progressTitleText">Đang tra cứu</span>
+    </h2>
+
+    <div class="progress-track">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <div class="hint" id="progressLabel" style="margin-bottom:16px;">Đã xử lý 0 / 0 mã (0%)</div>
+
+    <div class="stat-grid">
+      <div class="stat-tile">
+        <div class="stat-num stat-ok" id="statOk">0</div>
+        <div class="stat-label">Tìm thấy</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-num stat-warn" id="statNotFound">0</div>
+        <div class="stat-label">Không tìm thấy</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-num stat-err" id="statErr">0</div>
+        <div class="stat-label">Lỗi kết nối</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-num stat-muted" id="statSkipped">0</div>
+        <div class="stat-label">Bỏ qua (đã đủ)</div>
+      </div>
+    </div>
+
+    <div class="row-actions" style="margin-top:16px; margin-bottom:14px;">
+      <button class="btn secondary" id="pauseBtn">⏸ Tạm dừng</button>
+      <a id="downloadLink" class="btn hidden" href="#">⬇ Tải file kết quả (.xlsx)</a>
+      <button class="btn secondary hidden" id="restartBtn">Xử lý file khác</button>
+    </div>
+
+    <div class="progress-table-wrap" id="progressTableWrap">
+      <table class="preview" id="progressTable"></table>
+    </div>
+  </div>
+</div>
+
+<script>
+let uploadId = null;
+let currentSheets = [];
+let currentJobId = null;
+let pollTimer = null;
+let jobColumns = null; // {mst_col, name_col, status_col, name_header, status_header}
+
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const uploadStatus = document.getElementById('uploadStatus');
+const mappingCard = document.getElementById('mappingCard');
+const progressCard = document.getElementById('progressCard');
+const sheetSelect = document.getElementById('sheetSelect');
+const startRowInput = document.getElementById('startRow');
+const delayInput = document.getElementById('delay');
+const skipFilledInput = document.getElementById('skipFilled');
+const previewTable = document.getElementById('previewTable');
+const runBtn = document.getElementById('runBtn');
+const statusEl = document.getElementById('status');
+
+const colSelects = {
+  mst_col: document.getElementById('mstCol'),
+  name_col: document.getElementById('nameCol'),
+  address_col: document.getElementById('addressCol'),
+  dept_col: document.getElementById('deptCol'),
+  status_col: document.getElementById('statusCol'),
+};
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('drag');
+  if (e.dataTransfer.files.length) {
+    fileInput.files = e.dataTransfer.files;
+    handleUpload(e.dataTransfer.files[0]);
+  }
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length) handleUpload(fileInput.files[0]);
+});
+
+async function handleUpload(file) {
+  uploadStatus.textContent = 'Đang tải lên và phân tích file...';
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const res = await fetch('/api/upload', { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok) { uploadStatus.textContent = 'Lỗi: ' + data.error; return; }
+
+    uploadId = data.upload_id;
+    currentSheets = data.sheets;
+    uploadStatus.textContent = 'Đã tải lên: ' + file.name;
+
+    populateSheetSelect(data.sheets, data.active_sheet);
+    applyMappingResult(data.mapping, data.preview);
+    mappingCard.classList.remove('hidden');
+    progressCard.classList.add('hidden');
+    stopPolling();
+  } catch (err) {
+    uploadStatus.textContent = 'Lỗi khi tải file: ' + err;
+  }
+}
+
+function populateSheetSelect(sheets, active) {
+  sheetSelect.innerHTML = '';
+  sheets.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s; opt.textContent = s;
+    if (s === active) opt.selected = true;
+    sheetSelect.appendChild(opt);
+  });
+}
+
+sheetSelect.addEventListener('change', async () => {
+  const res = await fetch('/api/sheet_preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ upload_id: uploadId, sheet: sheetSelect.value }),
+  });
+  const data = await res.json();
+  if (!res.ok) { alert(data.error); return; }
+  applyMappingResult(data.mapping, data.preview);
+});
+
+function colLetterOptions(letters, headerRowVals, selectedLetter) {
+  let html = '<option value="">-- không dùng --</option>';
+  letters.forEach((L, idx) => {
+    const headerText = (headerRowVals[idx] || '').toString().slice(0, 24);
+    const label = headerText ? `${L} — ${headerText}` : L;
+    const sel = (L === selectedLetter) ? 'selected' : '';
+    html += `<option value="${L}" ${sel}>${label}</option>`;
+  });
+  return html;
+}
+
+function applyMappingResult(mapping, preview) {
+  const letters = preview.columns;
+  const headerRowIdx = (mapping.header_row || 1) - 1;
+  const headerVals = preview.rows[headerRowIdx] || [];
+
+  for (const field of Object.keys(colSelects)) {
+    colSelects[field].innerHTML = colLetterOptions(letters, headerVals, mapping[field]);
+  }
+  startRowInput.value = mapping.start_row || 3;
+
+  renderPreview(letters, preview.rows, headerRowIdx);
+}
+
+function renderPreview(letters, rows, headerRowIdx) {
+  let html = '<thead><tr><th></th>';
+  letters.forEach(L => html += `<th>${L}</th>`);
+  html += '</tr></thead><tbody>';
+  rows.forEach((row, i) => {
+    const isHeader = i === headerRowIdx;
+    html += `<tr style="${isHeader ? 'background:#eaf6ee;font-weight:600;' : ''}"><td>${i + 1}</td>`;
+    row.forEach(cell => html += `<td>${escapeHtml(cell)}</td>`);
+    html += '</tr>';
+  });
+  html += '</tbody>';
+  previewTable.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return (s || '').toString()
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+runBtn.addEventListener('click', async () => {
+  const payload = {
+    upload_id: uploadId,
+    sheet: sheetSelect.value,
+    start_row: parseInt(startRowInput.value, 10),
+    delay: parseFloat(delayInput.value),
+    skip_filled: skipFilledInput.checked,
+    mst_col: colSelects.mst_col.value,
+    name_col: colSelects.name_col.value,
+    address_col: colSelects.address_col.value,
+    dept_col: colSelects.dept_col.value,
+    status_col: colSelects.status_col.value,
+  };
+
+  if (!payload.mst_col) { alert('Bạn cần chọn cột chứa Mã số thuế'); return; }
+
+  runBtn.disabled = true;
+  statusEl.innerHTML = '<span class="spinner"></span>Đang khởi động...';
+
+  try {
+    const res = await fetch('/api/process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) { statusEl.textContent = ''; alert('Lỗi: ' + data.error); runBtn.disabled = false; return; }
+
+    startJob(data);
+  } catch (err) {
+    statusEl.textContent = '';
+    alert('Lỗi khi xử lý: ' + err);
+    runBtn.disabled = false;
+  }
+});
+
+function startJob(data) {
+  currentJobId = data.job_id;
+  jobColumns = data.columns;
+
+  statusEl.textContent = '';
+  runBtn.disabled = false;
+  document.getElementById('downloadLink').classList.add('hidden');
+  document.getElementById('restartBtn').classList.add('hidden');
+  document.getElementById('pauseBtn').classList.remove('hidden');
+  document.getElementById('pauseBtn').textContent = '⏸ Tạm dừng';
+  document.getElementById('pauseBtn').dataset.paused = 'false';
+  document.getElementById('progressTitleText').textContent = 'Đang tra cứu';
+
+  buildProgressTableHead();
+  progressCard.classList.remove('hidden');
+  progressCard.scrollIntoView({ behavior: 'smooth' });
+
+  poll();
+  pollTimer = setInterval(poll, 900);
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+async function poll() {
+  if (!currentJobId) return;
+  try {
+    const res = await fetch('/api/progress/' + currentJobId);
+    const data = await res.json();
+    if (!res.ok) { stopPolling(); return; }
+    renderProgress(data);
+    if (data.status === 'done' || data.status === 'stopped') {
+      stopPolling();
+      onJobFinished(data);
+    }
+  } catch (err) {
+    // bỏ qua lỗi poll thoáng qua, lần sau tự thử lại
+  }
+}
+
+function renderProgress(data) {
+  const pct = data.total ? Math.round((data.processed / data.total) * 100) : 0;
+  document.getElementById('progressFill').style.width = pct + '%';
+  document.getElementById('progressLabel').textContent =
+    `Đã xử lý ${data.processed} / ${data.total} mã (${pct}%)`;
+
+  document.getElementById('statOk').textContent = data.ok;
+  document.getElementById('statNotFound').textContent = data.not_found;
+  document.getElementById('statErr').textContent = data.errors;
+  document.getElementById('statSkipped').textContent = data.skipped;
+
+  const pauseBtn = document.getElementById('pauseBtn');
+  if (data.status === 'paused') {
+    pauseBtn.textContent = '▶ Tiếp tục';
+    pauseBtn.dataset.paused = 'true';
+  } else if (data.status === 'running') {
+    pauseBtn.textContent = '⏸ Tạm dừng';
+    pauseBtn.dataset.paused = 'false';
+  }
+
+  renderProgressTable(data.rows);
+}
+
+function buildProgressTableHead() {
+  const table = document.getElementById('progressTable');
+  table.className = 'progress-tbl';
+  const nameHeader = jobColumns.name_col ? escapeHtml(jobColumns.name_header) : null;
+  const statusHeader = jobColumns.status_col ? escapeHtml(jobColumns.status_header) : null;
+
+  let head = '<thead><tr><th>Dòng</th>' +
+    `<th><span class="col-chip">${jobColumns.mst_col}</span>MST</th>`;
+  if (nameHeader) head += `<th><span class="col-chip">${jobColumns.name_col}</span>${nameHeader}</th>`;
+  if (statusHeader) head += `<th><span class="col-chip">${jobColumns.status_col}</span>${statusHeader}</th>`;
+  head += '<th>Kết quả</th></tr></thead><tbody id="progressTbody"></tbody>';
+  table.innerHTML = head;
+}
+
+function resultBadge(item) {
+  switch (item.result) {
+    case 'ok':
+      return '<span class="result-badge badge-ok">✓ Đã điền</span>';
+    case 'not_found':
+      return '<span class="result-badge badge-warn">○ Không tìm thấy</span>';
+    case 'error':
+      return `<span class="result-badge badge-err">✗ Lỗi${item.detail ? ': ' + escapeHtml(item.detail) : ''}</span>`;
+    case 'skipped':
+      return '<span class="result-badge badge-muted">Bỏ qua (đã có)</span>';
+    case 'waiting': {
+      const s = item.wait_seconds != null ? item.wait_seconds : '';
+      const reason = item.detail ? escapeHtml(item.detail) : 'đang chờ';
+      return `<span class="result-badge badge-wait">⏳ Chờ ${s}s (${reason})</span>`;
+    }
+    default:
+      return '<span class="hint">...</span>';
+  }
+}
+
+function renderProgressTable(rows) {
+  const tbody = document.getElementById('progressTbody');
+  if (!tbody) return;
+
+  let activeRow = null;
+  const html = rows.map(item => {
+    const isActive = item.result === 'waiting' || (item.result === 'pending' && activeRow === null);
+    if (isActive && activeRow === null) activeRow = item.row;
+
+    let name = item.name != null ? escapeHtml(item.name) : (item.result === 'pending' ? '...' : '');
+    let statusVal = item.status_val != null ? escapeHtml(item.status_val) : (item.result === 'pending' ? '...' : '');
+
+    let cells = `<td>${item.row}</td><td>${escapeHtml(item.mst)}</td>`;
+    if (jobColumns.name_col) cells += `<td>${name}</td>`;
+    if (jobColumns.status_col) cells += `<td>${statusVal}</td>`;
+    cells += `<td>${resultBadge(item)}</td>`;
+
+    const cls = (item.result === 'waiting') ? 'row-active' : '';
+    return `<tr class="${cls}" data-row="${item.row}">${cells}</tr>`;
+  }).join('');
+
+  tbody.innerHTML = html;
+
+  const wrap = document.getElementById('progressTableWrap');
+  const activeEl = activeRow ? tbody.querySelector(`tr[data-row="${activeRow}"]`) : null;
+  if (activeEl) {
+    const wrapRect = wrap.getBoundingClientRect();
+    const elRect = activeEl.getBoundingClientRect();
+    if (elRect.top < wrapRect.top || elRect.bottom > wrapRect.bottom) {
+      activeEl.scrollIntoView({ block: 'center' });
+    }
+  }
+}
+
+function onJobFinished(data) {
+  document.getElementById('pauseBtn').classList.add('hidden');
+  document.getElementById('restartBtn').classList.remove('hidden');
+  document.getElementById('progressTitleText').textContent =
+    data.status === 'stopped' ? 'Đã dừng' : 'Hoàn tất';
+
+  if (data.result_id) {
+    const link = document.getElementById('downloadLink');
+    link.href = '/api/download/' + data.result_id;
+    link.classList.remove('hidden');
+  }
+}
+
+document.getElementById('pauseBtn').addEventListener('click', async () => {
+  if (!currentJobId) return;
+  const btn = document.getElementById('pauseBtn');
+  const isPaused = btn.dataset.paused === 'true';
+  const endpoint = isPaused ? 'resume' : 'pause';
+  btn.disabled = true;
+  try {
+    await fetch(`/api/${endpoint}/${currentJobId}`, { method: 'POST' });
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('restartBtn').addEventListener('click', () => {
+  uploadId = null;
+  currentJobId = null;
+  stopPolling();
+  fileInput.value = '';
+  uploadStatus.textContent = '';
+  mappingCard.classList.add('hidden');
+  progressCard.classList.add('hidden');
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+</script>
+</body>
+</html>
