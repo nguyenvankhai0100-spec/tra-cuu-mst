@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: vntax-tra-cuu-mst
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --worker-class gthread --workers 1 --threads 8 --timeout 120 -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: APP_PASSWORD
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
