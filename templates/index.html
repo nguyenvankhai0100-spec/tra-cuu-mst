@@ -305,7 +305,7 @@
       </div>
       <div>
         <label>Giãn cách giữa các lần gọi API (giây)</label>
-        <input type="number" id="delay" min="0" max="10" step="0.1" value="1.0">
+        <input type="number" id="delay" min="0" max="10" step="0.1" value="3.0">
       </div>
       <div style="display:flex; align-items:flex-end;">
         <label style="display:flex; align-items:center; gap:6px; margin-bottom:7px; cursor:pointer;">
@@ -397,6 +397,134 @@ let currentSheets = [];
 let currentJobId = null;
 let pollTimer = null;
 let jobColumns = null; // {mst_col, name_col, status_col, name_header, status_header}
+
+// QUAN TRỌNG: việc gọi api.xinvoice.vn được thực hiện NGAY TẠI TRÌNH DUYỆT
+// (ở đây), không phải từ server Flask. Lý do: api.xinvoice.vn đứng sau
+// Cloudflare, và Cloudflare chặn request gọi từ IP máy chủ hosting/cloud
+// (kiểu Render, AWS...) dù giả lập header trình duyệt thế nào đi nữa - nhưng
+// không chặn request thật từ trình duyệt người dùng (IP nhà/công ty họ).
+// api.xinvoice.vn cũng cho phép gọi cross-origin từ mọi domain
+// (access-control-allow-origin: *), nên cách này hoạt động bình thường.
+// Server chỉ nhận báo cáo kết quả (qua /api/report, /api/waiting, /api/finish)
+// để ghi vào file Excel và hiển thị bảng tiến trình.
+let isPaused = false;
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function buildLookupUrl(template, mst) {
+  return template.replace('{tax_code}', encodeURIComponent(mst));
+}
+
+async function lookupOneMst(apiTemplate, mst, onWait) {
+  const maxRetries = 2;
+  const baseBackoff = 1.5;
+  let lastDetail = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let resp;
+    try {
+      resp = await fetch(buildLookupUrl(apiTemplate, mst), { headers: { 'Accept': 'application/json' } });
+    } catch (err) {
+      lastDetail = 'Mất kết nối: ' + err;
+      const waitS = baseBackoff * (attempt + 1);
+      if (onWait) await onWait(waitS, 'Mất kết nối, đang thử lại...');
+      await sleep(waitS * 1000);
+      continue;
+    }
+
+    if (resp.status === 200) {
+      let payload;
+      try {
+        payload = await resp.json();
+      } catch (err) {
+        lastDetail = 'Phản hồi không phải JSON hợp lệ';
+        const waitS = baseBackoff * (attempt + 1);
+        if (onWait) await onWait(waitS, 'Phản hồi lỗi, đang thử lại...');
+        await sleep(waitS * 1000);
+        continue;
+      }
+      if (payload && payload.success && payload.data && payload.data.length) {
+        return { outcome: 'ok', data: payload.data[0] };
+      }
+      return { outcome: 'not_found' };
+    }
+
+    if (resp.status === 404) {
+      return { outcome: 'not_found' };
+    }
+
+    let bodySnippet = '';
+    try {
+      bodySnippet = (await resp.text()).replace(/\s+/g, ' ').trim().slice(0, 160);
+    } catch (err) { /* bỏ qua */ }
+    lastDetail = `HTTP ${resp.status}` + (bodySnippet ? `: ${bodySnippet}` : '');
+
+    if (resp.status !== 429 && resp.status >= 400 && resp.status < 500) {
+      return { outcome: 'error', detail: lastDetail };
+    }
+
+    let waitS, reason;
+    if (resp.status === 429) {
+      // Trình duyệt không đọc được header Retry-After của response cross-origin
+      // trừ khi server expose header đó, nên dùng công thức lùi cố định.
+      waitS = baseBackoff * (attempt + 2) * 2;
+      reason = 'Chờ do giới hạn tốc độ...';
+    } else {
+      waitS = baseBackoff * (attempt + 1);
+      reason = 'Đang thử lại...';
+    }
+    if (onWait) await onWait(waitS, reason);
+    await sleep(waitS * 1000);
+  }
+
+  return { outcome: 'error', detail: lastDetail || 'Lỗi không xác định' };
+}
+
+async function waitWhilePaused() {
+  while (isPaused) {
+    await sleep(300);
+  }
+}
+
+async function runLookupLoop(jobId, todoList, delaySec, apiTemplate) {
+  for (const item of todoList) {
+    await waitWhilePaused();
+
+    const result = await lookupOneMst(apiTemplate, item.mst, async (waitS, reason) => {
+      try {
+        await fetch(`/api/waiting/${jobId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ row: item.row, wait_seconds: waitS, reason }),
+        });
+      } catch (err) { /* không quan trọng bằng việc tự thử lại */ }
+    });
+
+    try {
+      await fetch(`/api/report/${jobId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          row: item.row, outcome: result.outcome,
+          data: result.data, detail: result.detail,
+        }),
+      });
+    } catch (err) {
+      // Không báo được kết quả về server (mất mạng phía người dùng đúng lúc
+      // đó) - bỏ qua dòng này, vòng lặp vẫn tiếp tục các dòng còn lại.
+    }
+
+    if (delaySec > 0) await sleep(delaySec * 1000);
+  }
+
+  try {
+    await fetch(`/api/finish/${jobId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stopped: false }),
+    });
+  } catch (err) { /* poll() sẽ không thấy status done, nhưng người dùng có thể thử tải lại trang */ }
+}
 
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
@@ -549,7 +677,7 @@ runBtn.addEventListener('click', async () => {
     const data = await res.json();
     if (!res.ok) { statusEl.textContent = ''; alert('Lỗi: ' + data.error); runBtn.disabled = false; return; }
 
-    startJob(data);
+    startJob(data, payload.delay);
   } catch (err) {
     statusEl.textContent = '';
     alert('Lỗi khi xử lý: ' + err);
@@ -557,9 +685,10 @@ runBtn.addEventListener('click', async () => {
   }
 });
 
-function startJob(data) {
+function startJob(data, delaySec) {
   currentJobId = data.job_id;
   jobColumns = data.columns;
+  isPaused = false;
 
   statusEl.textContent = '';
   runBtn.disabled = false;
@@ -576,6 +705,11 @@ function startJob(data) {
 
   poll();
   pollTimer = setInterval(poll, 900);
+
+  // Vòng lặp thật sự gọi api.xinvoice.vn chạy ngay tại trình duyệt này (xem
+  // ghi chú ở đầu <script>) - bảng tiến trình vẫn cập nhật qua poll() như cũ
+  // vì server nhận báo cáo từ vòng lặp này qua /api/report, /api/waiting.
+  runLookupLoop(data.job_id, data.todo, delaySec, data.api_template);
 }
 
 function stopPolling() {
@@ -609,14 +743,9 @@ function renderProgress(data) {
   document.getElementById('statErr').textContent = data.errors;
   document.getElementById('statSkipped').textContent = data.skipped;
 
-  const pauseBtn = document.getElementById('pauseBtn');
-  if (data.status === 'paused') {
-    pauseBtn.textContent = '▶ Tiếp tục';
-    pauseBtn.dataset.paused = 'true';
-  } else if (data.status === 'running') {
-    pauseBtn.textContent = '⏸ Tạm dừng';
-    pauseBtn.dataset.paused = 'false';
-  }
+  // Nút Tạm dừng/Tiếp tục được điều khiển trực tiếp bởi biến isPaused ở
+  // client (xem trình xử lý click bên dưới) vì vòng lặp gọi API giờ chạy tại
+  // trình duyệt - không đợi round-trip qua server nữa để tránh trễ/nhấp nháy.
 
   renderProgressTable(data.rows);
 }
@@ -705,14 +834,13 @@ function onJobFinished(data) {
 document.getElementById('pauseBtn').addEventListener('click', async () => {
   if (!currentJobId) return;
   const btn = document.getElementById('pauseBtn');
-  const isPaused = btn.dataset.paused === 'true';
-  const endpoint = isPaused ? 'resume' : 'pause';
-  btn.disabled = true;
+  const nowPaused = !isPaused;
+  isPaused = nowPaused; // vòng lặp client kiểm tra biến này trực tiếp - có hiệu lực ngay
+  btn.textContent = nowPaused ? '▶ Tiếp tục' : '⏸ Tạm dừng';
+  btn.dataset.paused = nowPaused ? 'true' : 'false';
   try {
-    await fetch(`/api/${endpoint}/${currentJobId}`, { method: 'POST' });
-  } finally {
-    btn.disabled = false;
-  }
+    await fetch(`/api/${nowPaused ? 'pause' : 'resume'}/${currentJobId}`, { method: 'POST' });
+  } catch (err) { /* trạng thái tạm dừng thật sự đã có hiệu lực ở client rồi */ }
 });
 
 document.getElementById('restartBtn').addEventListener('click', () => {
