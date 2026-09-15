@@ -26,9 +26,7 @@ import uuid
 import webbrowser
 from datetime import timedelta
 from pathlib import Path
-from urllib.parse import quote
 
-import requests
 from flask import (Flask, jsonify, redirect, render_template, request,
                     send_file, session, url_for)
 from openpyxl import load_workbook
@@ -44,31 +42,28 @@ STORE_DIR.mkdir(exist_ok=True)
 # mật khẩu - vì lúc đó chỉ có mình máy bạn truy cập được (127.0.0.1) rồi.
 APP_PASSWORD = os.environ.get("APP_PASSWORD")
 
+# QUAN TRỌNG: api.xinvoice.vn đứng sau Cloudflare, và Cloudflare chặn (trả về
+# trang thử thách "Just a moment...") các request gọi từ IP của nhà cung cấp
+# hosting/cloud (Render, AWS, GCP...) dù request đó có giả lập header trình
+# duyệt cỡ nào đi nữa - IP datacenter bị coi là đáng ngờ. Vì vậy việc gọi API
+# này KHÔNG được thực hiện từ server (Python) nữa, mà được thực hiện trực
+# tiếp từ trình duyệt của người dùng bằng JavaScript (xem templates/index.html)
+# - lúc đó request xuất phát từ IP thật của người dùng (nhà/công ty họ), y hệt
+# như khi họ tự mở link này trong trình duyệt, nên không bị chặn. May mắn là
+# api.xinvoice.vn cũng cho phép gọi từ trình duyệt ở bất kỳ domain nào
+# (header access-control-allow-origin: *), nên cách này hoạt động được.
+# Server (Flask) giờ chỉ còn nhiệm vụ: đọc/ghi file Excel và tổng hợp tiến
+# trình để hiển thị bảng theo dõi - không tự gọi api.xinvoice.vn nữa.
 API_TEMPLATE = "https://api.xinvoice.vn/gdt-api/tax-payer-records/{tax_code}"
 NOT_FOUND_TEXT = "Không tìm thấy"
 ERROR_TEXT = "Lỗi tra cứu"
-# Một số máy chủ (đặc biệt là các IP của nhà cung cấp hosting/cloud như
-# Render, AWS, GCP...) bị api.xinvoice.vn (hoặc lớp tường lửa phía trước nó)
-# chặn nếu request trông "giống bot" - ví dụ User-Agent mặc định của thư viện
-# requests là "python-requests/x.y.z". Giả lập header của một trình duyệt
-# thật giúp giảm khả năng bị chặn kiểu này.
-API_REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://api.xinvoice.vn/",
-    "Origin": "https://api.xinvoice.vn",
-}
 
 MAX_PREVIEW_ROWS = 12
 MAX_HEADER_SCAN_ROWS = 10
 
 # In-memory store: upload_id -> {"path": Path, "sheet": str}
 #                  result_id -> Path
-#                  job_id -> job state dict (xem process_job)
+#                  job_id -> job state dict (cập nhật bởi /api/report, /api/waiting, /api/finish)
 _uploads = {}
 _results = {}
 _jobs = {}
@@ -242,68 +237,6 @@ def clean_tax_code(raw):
     return s
 
 
-def lookup_tax_code(tax_code, session, on_wait=None, timeout=15, retries=2, backoff=1.5):
-    """
-    Gọi API cho một mã số thuế.
-    on_wait(wait_seconds, reason): callback được gọi NGAY TRƯỚC khi sleep để chờ
-    thử lại - dùng để báo cáo trạng thái "đang chờ" ra ngoài (ví dụ cho UI biết
-    dòng này đang chờ do bị giới hạn tốc độ).
-    """
-    url = API_TEMPLATE.format(tax_code=quote(tax_code, safe="-"))
-    last_err = None
-    for attempt in range(retries + 1):
-        try:
-            resp = session.get(url, timeout=timeout)
-        except requests.RequestException as e:
-            last_err = f"lỗi kết nối: {e}"
-            wait_s = backoff * (attempt + 1)
-            if on_wait:
-                on_wait(wait_s, "Mất kết nối, đang thử lại...")
-            time.sleep(wait_s)
-            continue
-
-        if resp.status_code == 200:
-            try:
-                payload = resp.json()
-            except ValueError:
-                last_err = "phản hồi không phải JSON hợp lệ"
-                wait_s = backoff * (attempt + 1)
-                if on_wait:
-                    on_wait(wait_s, "Phản hồi lỗi, đang thử lại...")
-                time.sleep(wait_s)
-                continue
-            if payload.get("success") and payload.get("data"):
-                return payload["data"][0], None
-            return None, "not_found"
-
-        if resp.status_code == 404:
-            return None, "not_found"
-
-        last_err = f"HTTP {resp.status_code}"
-        # Ghi kèm một đoạn ngắn nội dung phản hồi để biết lý do bị chặn thật sự
-        # (ví dụ trang chặn của tường lửa/Cloudflare) thay vì chỉ có mã lỗi.
-        try:
-            body_snippet = resp.text.strip().replace("\n", " ")[:160]
-        except Exception:
-            body_snippet = ""
-        if body_snippet:
-            last_err = f"{last_err}: {body_snippet}"
-        if 400 <= resp.status_code < 500 and resp.status_code != 429:
-            break
-        if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            wait_s = float(retry_after) if retry_after and retry_after.isdigit() else backoff * (attempt + 2) * 2
-            reason = "Chờ do giới hạn tốc độ..."
-        else:
-            wait_s = backoff * (attempt + 1)
-            reason = "Đang thử lại..."
-        if on_wait:
-            on_wait(wait_s, reason)
-        time.sleep(wait_s)
-
-    return None, last_err or "lỗi không xác định"
-
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -377,91 +310,90 @@ def api_sheet_preview():
     })
 
 
-def process_job(job_id):
-    """Chạy trong thread nền: lần lượt tra cứu các dòng 'pending' và cập nhật
-    trạng thái job để /api/progress đọc được theo thời gian thực."""
-    job = _jobs[job_id]
-    wb = job["_wb"]
-    ws = job["_ws"]
-    session = requests.Session()
-    session.headers.update(API_REQUEST_HEADERS)
+def _find_row_entry(job, row):
+    for r in job["rows"]:
+        if r["row"] == row:
+            return r
+    return None
 
-    mst_col = job["mst_col"]
+
+def apply_lookup_result(job, row, outcome, data=None, detail=None):
+    """Ghi kết quả tra cứu MỘT dòng (do trình duyệt gọi API và báo về) vào
+    workbook + trạng thái job. outcome là 'ok' / 'not_found' / 'error'.
+    Đây là phần logic trước kia nằm trong process_job (chạy ở server), giờ
+    được gọi từ route /api/report vì việc gọi api.xinvoice.vn đã chuyển sang
+    chạy ở trình duyệt người dùng."""
+    row_entry = _find_row_entry(job, row)
+    if row_entry is None:
+        return False
+
+    ws = job["_ws"]
     name_col = job["name_col"]
     address_col = job["address_col"]
     dept_col = job["dept_col"]
     status_col = job["status_col"]
-    delay = job["delay"]
 
-    for row_entry in job["rows"]:
-        if row_entry["result"] != "pending":
-            continue
+    row_entry.pop("wait_until", None)
 
-        # Tạm dừng: chờ tới khi được resume hoặc bị dừng hẳn
-        while job["control"] == "pause":
-            job["status"] = "paused"
-            time.sleep(0.3)
-        if job["control"] == "stop":
-            break
-        job["status"] = "running"
+    if outcome == "ok" and data:
+        if name_col:
+            ws[f"{name_col}{row}"] = data.get("name", "")
+        if address_col:
+            ws[f"{address_col}{row}"] = data.get("address", "")
+        if dept_col:
+            ws[f"{dept_col}{row}"] = data.get("taxDepartment", "")
+        if status_col:
+            ws[f"{status_col}{row}"] = data.get("status", "")
+        row_entry["result"] = "ok"
+        row_entry["name"] = data.get("name", "")
+        row_entry["status_val"] = data.get("status", "")
+        row_entry["detail"] = None
+        job["ok"] += 1
+    elif outcome == "not_found":
+        for col in (name_col, address_col, dept_col, status_col):
+            if col:
+                ws[f"{col}{row}"] = NOT_FOUND_TEXT
+        row_entry["result"] = "not_found"
+        if name_col:
+            row_entry["name"] = NOT_FOUND_TEXT
+        if status_col:
+            row_entry["status_val"] = NOT_FOUND_TEXT
+        job["not_found"] += 1
+    else:
+        for col in (name_col, address_col, dept_col, status_col):
+            if col:
+                ws[f"{col}{row}"] = ERROR_TEXT
+        row_entry["result"] = "error"
+        row_entry["detail"] = detail or "lỗi không xác định"
+        if name_col:
+            row_entry["name"] = ERROR_TEXT
+        if status_col:
+            row_entry["status_val"] = ERROR_TEXT
+        job["errors"] += 1
 
-        row = row_entry["row"]
-        mst = row_entry["mst"]
+    job["processed"] += 1
+    return True
 
-        def on_wait(wait_s, reason, _entry=row_entry):
-            _entry["result"] = "waiting"
-            _entry["wait_until"] = time.time() + wait_s
-            _entry["detail"] = reason
 
-        data, err = lookup_tax_code(mst, session, on_wait=on_wait)
-        row_entry.pop("wait_until", None)
+def mark_waiting(job, row, wait_seconds, reason):
+    row_entry = _find_row_entry(job, row)
+    if row_entry is None:
+        return False
+    row_entry["result"] = "waiting"
+    row_entry["wait_until"] = time.time() + max(0, wait_seconds)
+    row_entry["detail"] = reason
+    return True
 
-        if data:
-            if name_col:
-                ws[f"{name_col}{row}"] = data.get("name", "")
-            if address_col:
-                ws[f"{address_col}{row}"] = data.get("address", "")
-            if dept_col:
-                ws[f"{dept_col}{row}"] = data.get("taxDepartment", "")
-            if status_col:
-                ws[f"{status_col}{row}"] = data.get("status", "")
-            row_entry["result"] = "ok"
-            row_entry["name"] = data.get("name", "")
-            row_entry["status_val"] = data.get("status", "")
-            row_entry["detail"] = None
-            job["ok"] += 1
-        elif err == "not_found":
-            for col in (name_col, address_col, dept_col, status_col):
-                if col:
-                    ws[f"{col}{row}"] = NOT_FOUND_TEXT
-            row_entry["result"] = "not_found"
-            if name_col:
-                row_entry["name"] = NOT_FOUND_TEXT
-            if status_col:
-                row_entry["status_val"] = NOT_FOUND_TEXT
-            job["not_found"] += 1
-        else:
-            for col in (name_col, address_col, dept_col, status_col):
-                if col:
-                    ws[f"{col}{row}"] = ERROR_TEXT
-            row_entry["result"] = "error"
-            row_entry["detail"] = err
-            if name_col:
-                row_entry["name"] = ERROR_TEXT
-            if status_col:
-                row_entry["status_val"] = ERROR_TEXT
-            job["errors"] += 1
 
-        job["processed"] += 1
-
-        if job["control"] == "stop":
-            break
-        if delay > 0:
-            time.sleep(delay)
-
-    if job["control"] == "stop":
+def finish_job(job, stopped):
+    """Lưu file kết quả (nếu chạy xong hoặc dừng giữa chừng) - trình duyệt gọi
+    route này khi vòng lặp tra cứu client-side đã kết thúc."""
+    if job.get("result_id"):
+        return  # đã lưu rồi (tránh lưu 2 lần nếu client gọi finish 2 lần)
+    if stopped:
         job["status"] = "stopped"
     else:
+        wb = job["_wb"]
         result_id = uuid.uuid4().hex
         result_path = STORE_DIR / f"{result_id}_result.xlsx"
         wb.save(result_path)
@@ -489,7 +421,7 @@ def api_process():
     except (TypeError, ValueError):
         return jsonify({"error": "Dòng bắt đầu không hợp lệ"}), 400
     try:
-        delay = float(data.get("delay", 1.0))
+        delay = float(data.get("delay", 3.0))
     except (TypeError, ValueError):
         delay = 1.0
     delay = max(0.0, min(delay, 10.0))
@@ -571,12 +503,16 @@ def api_process():
     with _jobs_lock:
         _jobs[job_id] = job
 
-    thread = threading.Thread(target=process_job, args=(job_id,), daemon=True)
-    thread.start()
+    # Việc gọi api.xinvoice.vn giờ do trình duyệt (JS) thực hiện trực tiếp -
+    # xem ghi chú tại API_TEMPLATE ở đầu file. Server chỉ trả về danh sách
+    # các dòng cần tra (bỏ qua dòng đã "skipped") để trình duyệt tự lặp qua.
+    todo = [{"row": r["row"], "mst": r["mst"]} for r in rows if r["result"] == "pending"]
 
     return jsonify({
         "job_id": job_id,
         "total": total,
+        "todo": todo,
+        "api_template": API_TEMPLATE,
         "columns": {
             "mst_col": mst_col, "name_col": name_col, "status_col": status_col,
             "name_header": name_header, "status_header": status_header,
@@ -632,6 +568,64 @@ def api_resume(job_id):
     job["control"] = "run"
     job["status"] = "running"
     return jsonify({"status": "running"})
+
+
+@app.route("/api/report/<job_id>", methods=["POST"])
+def api_report(job_id):
+    """Trình duyệt gọi route này sau khi TỰ gọi api.xinvoice.vn xong cho một
+    dòng, để báo kết quả về cho server ghi vào file Excel + cập nhật số liệu
+    tiến trình (server không tự gọi API nữa - xem ghi chú ở API_TEMPLATE)."""
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Phiên xử lý không tồn tại"}), 404
+    data = request.get_json(force=True)
+    try:
+        row = int(data.get("row"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "row không hợp lệ"}), 400
+    outcome = data.get("outcome")
+    if outcome not in ("ok", "not_found", "error"):
+        return jsonify({"error": "outcome không hợp lệ"}), 400
+
+    with _jobs_lock:
+        ok = apply_lookup_result(job, row, outcome, data=data.get("data"), detail=data.get("detail"))
+    if not ok:
+        return jsonify({"error": "Không tìm thấy dòng này trong job"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/waiting/<job_id>", methods=["POST"])
+def api_waiting(job_id):
+    """Trình duyệt gọi route này khi đang chờ (ví dụ do api.xinvoice.vn trả
+    về 429 giới hạn tốc độ) để bảng tiến trình hiện đúng trạng thái 'đang chờ'
+    thay vì trông như bị treo."""
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Phiên xử lý không tồn tại"}), 404
+    data = request.get_json(force=True)
+    try:
+        row = int(data.get("row"))
+        wait_seconds = float(data.get("wait_seconds", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "dữ liệu không hợp lệ"}), 400
+    reason = data.get("reason") or "Đang chờ..."
+    mark_waiting(job, row, wait_seconds, reason)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/finish/<job_id>", methods=["POST"])
+def api_finish(job_id):
+    """Trình duyệt gọi route này khi vòng lặp tra cứu (chạy ở client) đã xử
+    lý xong toàn bộ danh sách hoặc bị dừng giữa chừng - để server lưu file
+    kết quả và trả link tải về."""
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Phiên xử lý không tồn tại"}), 404
+    data = request.get_json(force=True) or {}
+    stopped = bool(data.get("stopped"))
+    with _jobs_lock:
+        finish_job(job, stopped)
+    return jsonify({"status": job["status"], "result_id": job.get("result_id")})
 
 
 @app.route("/api/download/<result_id>")
