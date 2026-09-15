@@ -47,6 +47,21 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD")
 API_TEMPLATE = "https://api.xinvoice.vn/gdt-api/tax-payer-records/{tax_code}"
 NOT_FOUND_TEXT = "Không tìm thấy"
 ERROR_TEXT = "Lỗi tra cứu"
+# Một số máy chủ (đặc biệt là các IP của nhà cung cấp hosting/cloud như
+# Render, AWS, GCP...) bị api.xinvoice.vn (hoặc lớp tường lửa phía trước nó)
+# chặn nếu request trông "giống bot" - ví dụ User-Agent mặc định của thư viện
+# requests là "python-requests/x.y.z". Giả lập header của một trình duyệt
+# thật giúp giảm khả năng bị chặn kiểu này.
+API_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://api.xinvoice.vn/",
+    "Origin": "https://api.xinvoice.vn",
+}
 
 MAX_PREVIEW_ROWS = 12
 MAX_HEADER_SCAN_ROWS = 10
@@ -265,6 +280,14 @@ def lookup_tax_code(tax_code, session, on_wait=None, timeout=15, retries=2, back
             return None, "not_found"
 
         last_err = f"HTTP {resp.status_code}"
+        # Ghi kèm một đoạn ngắn nội dung phản hồi để biết lý do bị chặn thật sự
+        # (ví dụ trang chặn của tường lửa/Cloudflare) thay vì chỉ có mã lỗi.
+        try:
+            body_snippet = resp.text.strip().replace("\n", " ")[:160]
+        except Exception:
+            body_snippet = ""
+        if body_snippet:
+            last_err = f"{last_err}: {body_snippet}"
         if 400 <= resp.status_code < 500 and resp.status_code != 429:
             break
         if resp.status_code == 429:
@@ -361,6 +384,7 @@ def process_job(job_id):
     wb = job["_wb"]
     ws = job["_ws"]
     session = requests.Session()
+    session.headers.update(API_REQUEST_HEADERS)
 
     mst_col = job["mst_col"]
     name_col = job["name_col"]
