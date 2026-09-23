@@ -152,7 +152,7 @@ FIELD_KEYWORDS = {
 def guess_header_row(ws):
     """Tìm dòng tiêu đề: dòng có nhiều ô khớp từ khóa nhất trong MAX_HEADER_SCAN_ROWS dòng đầu."""
     best_row, best_score = 1, -1
-    max_col = min(ws.max_column, 30)
+    max_col = min(ws.max_column, 500)
     max_row = min(ws.max_row, MAX_HEADER_SCAN_ROWS)
     for r in range(1, max_row + 1):
         score = 0
@@ -172,7 +172,7 @@ def guess_header_row(ws):
 
 def guess_mapping(ws):
     header_row = guess_header_row(ws)
-    max_col = min(ws.max_column, 40)
+    max_col = min(ws.max_column, 500)
 
     assigned = {}
     used_cols = set()
@@ -211,8 +211,23 @@ def guess_mapping(ws):
 
 
 def build_preview(ws):
-    max_col = min(ws.max_column, 12)
+    """Xem trước dữ liệu: liệt kê đúng từ cột A tới cột cuối cùng THỰC SỰ có
+    dữ liệu, thay vì một số cột cố định. Trước đây bị chặn cứng ở 12 cột
+    (A..L) nên file nào có cột M, N... trở đi thì mất luôn, không chọn được
+    trong ô chọn cột lẫn không hiện trong bảng xem trước."""
     max_row = min(ws.max_row, MAX_PREVIEW_ROWS)
+    # Trần quét an toàn để không dò vô hạn nếu Excel "phồng" max_column do
+    # định dạng ô để trống — nhưng đủ rộng để không chặn cột dữ liệu thật.
+    scan_col_cap = min(ws.max_column, 500)
+
+    last_data_col = 0
+    for r in range(1, max_row + 1):
+        for c in range(1, scan_col_cap + 1):
+            if ws.cell(row=r, column=c).value not in (None, ""):
+                if c > last_data_col:
+                    last_data_col = c
+    max_col = max(last_data_col, 1)
+
     rows = []
     for r in range(1, max_row + 1):
         row_vals = []
