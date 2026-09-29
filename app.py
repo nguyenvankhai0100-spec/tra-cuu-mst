@@ -43,18 +43,18 @@ STORE_DIR.mkdir(exist_ok=True)
 # mật khẩu - vì lúc đó chỉ có mình máy bạn truy cập được (127.0.0.1) rồi.
 APP_PASSWORD = os.environ.get("APP_PASSWORD")
 
-# QUAN TRỌNG: api.xinvoice.vn đứng sau Cloudflare, và Cloudflare chặn (trả về
-# trang thử thách "Just a moment...") các request gọi từ IP của nhà cung cấp
-# hosting/cloud (Render, AWS, GCP...) dù request đó có giả lập header trình
-# duyệt cỡ nào đi nữa - IP datacenter bị coi là đáng ngờ. Vì vậy việc gọi API
-# này KHÔNG được thực hiện từ server (Python) nữa, mà được thực hiện trực
-# tiếp từ trình duyệt của người dùng bằng JavaScript (xem templates/index.html)
-# - lúc đó request xuất phát từ IP thật của người dùng (nhà/công ty họ), y hệt
-# như khi họ tự mở link này trong trình duyệt, nên không bị chặn. May mắn là
-# api.xinvoice.vn cũng cho phép gọi từ trình duyệt ở bất kỳ domain nào
-# (header access-control-allow-origin: *), nên cách này hoạt động được.
-# Server (Flask) giờ chỉ còn nhiệm vụ: đọc/ghi file Excel và tổng hợp tiến
-# trình để hiển thị bảng theo dõi - không tự gọi api.xinvoice.vn nữa.
+# LỊCH SỬ (để không ai lặp lại nhầm lẫn này lần nữa): bản trước từng cho
+# rằng api.xinvoice.vn (đứng sau Cloudflare) chặn request gọi từ IP hosting/
+# cloud (Render, AWS...) nên chuyển việc gọi API sang chạy ở trình duyệt
+# người dùng bằng JavaScript. Nhưng thực tế kiểm tra lại (qua route chẩn
+# đoán tạm /api/test_lookup, đã xoá sau khi dùng xong) cho thấy: (1) Render
+# gọi api.xinvoice.vn HOÀN TOÀN BÌNH THƯỜNG, không hề bị chặn; (2) ngược lại,
+# api.xinvoice.vn KHÔNG trả header access-control-allow-origin, nên cách gọi
+# từ trình duyệt mới là cách chắc chắn không bao giờ chạy được (trình duyệt
+# tự chặn theo CORS, không phải do api chặn) - xem lỗi Console thực tế người
+# dùng gặp: "No 'Access-Control-Allow-Origin' header is present...". Vì vậy
+# việc gọi API được chuyển lại về server (xem lookup_mst_serverside +
+# process_job_serverside bên dưới) - đơn giản và đúng hơn hẳn.
 API_TEMPLATE = "https://api.xinvoice.vn/gdt-api/tax-payer-records/{tax_code}"
 NOT_FOUND_TEXT = "Không tìm thấy"
 ERROR_TEXT = "Lỗi tra cứu"
@@ -253,6 +253,136 @@ def clean_tax_code(raw):
     return s
 
 
+_LOOKUP_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+}
+
+
+def lookup_mst_serverside(mst, on_wait=None):
+    """Gọi api.xinvoice.vn thật, ngay từ server (đã xác nhận Render gọi
+    được bình thường - xem ghi chú ở API_TEMPLATE). Có tự thử lại khi gặp
+    lỗi tạm thời, lùi thời gian chờ dài hơn hẳn khi gặp lỗi mạng thật (khả
+    năng cao là bị giới hạn tốc độ/chặn tạm thời) so với các lỗi vặt khác.
+    on_wait(wait_seconds, reason), nếu có, được gọi trước mỗi lần chờ để nơi
+    gọi (process_job_serverside) có thể cập nhật bảng tiến trình cho người
+    dùng thấy đang chờ, không phải bị treo."""
+    max_retries = 2
+    base_backoff = 1.5
+    last_detail = None
+    saw_network_failure = False
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(API_TEMPLATE.format(tax_code=mst), headers=_LOOKUP_HEADERS, timeout=15)
+        except Exception as e:
+            saw_network_failure = True
+            last_detail = f"Mất kết nối: {e}"
+            wait_s = 8 * (attempt + 1)
+            if on_wait:
+                on_wait(wait_s, "Mất kết nối, đang thử lại...")
+            time.sleep(wait_s)
+            continue
+
+        if resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except ValueError:
+                last_detail = "Phản hồi không phải JSON hợp lệ"
+                wait_s = base_backoff * (attempt + 1)
+                if on_wait:
+                    on_wait(wait_s, "Phản hồi lỗi, đang thử lại...")
+                time.sleep(wait_s)
+                continue
+            if payload and payload.get("success") and payload.get("data"):
+                return {"outcome": "ok", "data": payload["data"][0]}
+            return {"outcome": "not_found"}
+
+        if resp.status_code == 404:
+            return {"outcome": "not_found"}
+
+        body_snippet = ""
+        if resp.text:
+            body_snippet = " ".join(resp.text.split())[:160]
+        last_detail = f"HTTP {resp.status_code}" + (f": {body_snippet}" if body_snippet else "")
+
+        if resp.status_code != 429 and 400 <= resp.status_code < 500:
+            return {"outcome": "error", "detail": last_detail}
+
+        if resp.status_code == 429:
+            # api.xinvoice.vn giới hạn khoảng 10 lượt/30 giây (thấy được qua
+            # header ratelimit trên response) - lùi thời gian chờ nhiều hơn.
+            saw_network_failure = True
+            wait_s = base_backoff * (attempt + 2) * 2
+            reason = "Chờ do giới hạn tốc độ..."
+        else:
+            wait_s = base_backoff * (attempt + 1)
+            reason = "Đang thử lại..."
+        if on_wait:
+            on_wait(wait_s, reason)
+        time.sleep(wait_s)
+
+    return {"outcome": "error", "detail": last_detail or "Lỗi không xác định", "network_failure": saw_network_failure}
+
+
+def process_job_serverside(job_id):
+    """Chạy nền (background thread): lần lượt tra cứu từng mã số thuế còn
+    'pending' của job, ghi kết quả vào workbook + trạng thái job qua
+    apply_lookup_result/mark_waiting (dùng chung với model cũ), rồi lưu file
+    kết quả bằng finish_job khi xong. Tôn trọng nút Tạm dừng/Tiếp tục qua
+    job['control']. Nếu 3 mã liên tiếp đều gặp lỗi mạng (networkFailure) -
+    dấu hiệu rõ ràng là đang bị giới hạn tốc độ/chặn tạm thời, không phải
+    xui từng mã lẻ tẻ - tự nghỉ hẳn 60 giây trước khi thử mã tiếp theo, thay
+    vì cứ gọi dồn dập làm tình trạng đó kéo dài thêm."""
+    job = _jobs.get(job_id)
+    if not job:
+        return
+
+    COOLDOWN_AFTER = 3
+    COOLDOWN_SECONDS = 60
+    consecutive_network_failures = 0
+
+    todo = [r for r in job["rows"] if r["result"] == "pending"]
+    for entry in todo:
+        while job.get("control") == "pause":
+            time.sleep(0.3)
+
+        row = entry["row"]
+        mst = entry["mst"]
+
+        if consecutive_network_failures >= COOLDOWN_AFTER:
+            with _jobs_lock:
+                mark_waiting(
+                    job, row, COOLDOWN_SECONDS,
+                    f"Có vẻ đang bị chặn tạm thời do gọi quá nhanh — tạm nghỉ {COOLDOWN_SECONDS}s rồi tự tiếp tục...",
+                )
+            time.sleep(COOLDOWN_SECONDS)
+            consecutive_network_failures = 0
+
+        def on_wait(wait_s, reason, _row=row):
+            with _jobs_lock:
+                mark_waiting(job, _row, wait_s, reason)
+
+        result = lookup_mst_serverside(mst, on_wait=on_wait)
+
+        with _jobs_lock:
+            apply_lookup_result(job, row, result["outcome"], data=result.get("data"), detail=result.get("detail"))
+
+        if result.get("network_failure"):
+            consecutive_network_failures += 1
+        else:
+            consecutive_network_failures = 0
+
+        if job["delay"] > 0:
+            time.sleep(job["delay"])
+
+    with _jobs_lock:
+        finish_job(job, stopped=False)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -260,42 +390,6 @@ def clean_tax_code(raw):
 @app.route("/")
 def index():
     return render_template("index.html", show_logout=bool(APP_PASSWORD))
-
-
-@app.route("/api/test_lookup/<mst>")
-def api_test_lookup(mst):
-    """Route TẠM để kiểm tra xem SERVER (Render) có tự gọi được
-    api.xinvoice.vn hay không, sau khi phát hiện cách gọi từ trình duyệt
-    (JS fetch) chắc chắn không bao giờ hoạt động được — api.xinvoice.vn
-    không trả header access-control-allow-origin nên trình duyệt luôn chặn
-    bằng CORS, bất kể gọi bao nhiêu lần hay chờ bao lâu. Route này không
-    dùng cho luồng chính, chỉ để xác minh trước khi sửa lại kiến trúc.
-    Mở trực tiếp link dạng /api/test_lookup/<mã số thuế> trên trình duyệt để xem kết quả."""
-    try:
-        resp = requests.get(
-            API_TEMPLATE.format(tax_code=mst),
-            headers={
-                "Accept": "application/json",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-                ),
-            },
-            timeout=15,
-        )
-    except Exception as e:
-        return jsonify({"server_side_call": "exception", "detail": str(e)}), 200
-
-    content_type = resp.headers.get("Content-Type", "")
-    is_json = "json" in content_type.lower()
-    body_snippet = resp.text[:500]
-    return jsonify({
-        "server_side_call": "completed",
-        "http_status": resp.status_code,
-        "content_type": content_type,
-        "looks_like_json": is_json,
-        "body_snippet": body_snippet,
-    }), 200
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -370,11 +464,9 @@ def _find_row_entry(job, row):
 
 
 def apply_lookup_result(job, row, outcome, data=None, detail=None):
-    """Ghi kết quả tra cứu MỘT dòng (do trình duyệt gọi API và báo về) vào
-    workbook + trạng thái job. outcome là 'ok' / 'not_found' / 'error'.
-    Đây là phần logic trước kia nằm trong process_job (chạy ở server), giờ
-    được gọi từ route /api/report vì việc gọi api.xinvoice.vn đã chuyển sang
-    chạy ở trình duyệt người dùng."""
+    """Ghi kết quả tra cứu MỘT dòng vào workbook + trạng thái job. outcome là
+    'ok' / 'not_found' / 'error'. Gọi trực tiếp từ process_job_serverside
+    (chạy nền trên server) sau mỗi lần lookup_mst_serverside trả về."""
     row_entry = _find_row_entry(job, row)
     if row_entry is None:
         return False
@@ -438,10 +530,10 @@ def mark_waiting(job, row, wait_seconds, reason):
 
 
 def finish_job(job, stopped):
-    """Lưu file kết quả (nếu chạy xong hoặc dừng giữa chừng) - trình duyệt gọi
-    route này khi vòng lặp tra cứu client-side đã kết thúc."""
+    """Lưu file kết quả (nếu chạy xong hoặc dừng giữa chừng) - gọi từ cuối
+    process_job_serverside khi vòng lặp tra cứu trên server đã kết thúc."""
     if job.get("result_id"):
-        return  # đã lưu rồi (tránh lưu 2 lần nếu client gọi finish 2 lần)
+        return  # đã lưu rồi (tránh lưu 2 lần)
     if stopped:
         job["status"] = "stopped"
     else:
@@ -555,16 +647,14 @@ def api_process():
     with _jobs_lock:
         _jobs[job_id] = job
 
-    # Việc gọi api.xinvoice.vn giờ do trình duyệt (JS) thực hiện trực tiếp -
-    # xem ghi chú tại API_TEMPLATE ở đầu file. Server chỉ trả về danh sách
-    # các dòng cần tra (bỏ qua dòng đã "skipped") để trình duyệt tự lặp qua.
-    todo = [{"row": r["row"], "mst": r["mst"]} for r in rows if r["result"] == "pending"]
+    # Server tự chạy nền, tự gọi api.xinvoice.vn cho từng dòng còn "pending"
+    # (xem process_job_serverside + ghi chú ở API_TEMPLATE) - trình duyệt chỉ
+    # còn việc poll /api/progress để hiển thị bảng theo dõi.
+    threading.Thread(target=process_job_serverside, args=(job_id,), daemon=True).start()
 
     return jsonify({
         "job_id": job_id,
         "total": total,
-        "todo": todo,
-        "api_template": API_TEMPLATE,
         "columns": {
             "mst_col": mst_col, "name_col": name_col, "status_col": status_col,
             "name_header": name_header, "status_header": status_header,
@@ -620,64 +710,6 @@ def api_resume(job_id):
     job["control"] = "run"
     job["status"] = "running"
     return jsonify({"status": "running"})
-
-
-@app.route("/api/report/<job_id>", methods=["POST"])
-def api_report(job_id):
-    """Trình duyệt gọi route này sau khi TỰ gọi api.xinvoice.vn xong cho một
-    dòng, để báo kết quả về cho server ghi vào file Excel + cập nhật số liệu
-    tiến trình (server không tự gọi API nữa - xem ghi chú ở API_TEMPLATE)."""
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Phiên xử lý không tồn tại"}), 404
-    data = request.get_json(force=True)
-    try:
-        row = int(data.get("row"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "row không hợp lệ"}), 400
-    outcome = data.get("outcome")
-    if outcome not in ("ok", "not_found", "error"):
-        return jsonify({"error": "outcome không hợp lệ"}), 400
-
-    with _jobs_lock:
-        ok = apply_lookup_result(job, row, outcome, data=data.get("data"), detail=data.get("detail"))
-    if not ok:
-        return jsonify({"error": "Không tìm thấy dòng này trong job"}), 404
-    return jsonify({"ok": True})
-
-
-@app.route("/api/waiting/<job_id>", methods=["POST"])
-def api_waiting(job_id):
-    """Trình duyệt gọi route này khi đang chờ (ví dụ do api.xinvoice.vn trả
-    về 429 giới hạn tốc độ) để bảng tiến trình hiện đúng trạng thái 'đang chờ'
-    thay vì trông như bị treo."""
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Phiên xử lý không tồn tại"}), 404
-    data = request.get_json(force=True)
-    try:
-        row = int(data.get("row"))
-        wait_seconds = float(data.get("wait_seconds", 0))
-    except (TypeError, ValueError):
-        return jsonify({"error": "dữ liệu không hợp lệ"}), 400
-    reason = data.get("reason") or "Đang chờ..."
-    mark_waiting(job, row, wait_seconds, reason)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/finish/<job_id>", methods=["POST"])
-def api_finish(job_id):
-    """Trình duyệt gọi route này khi vòng lặp tra cứu (chạy ở client) đã xử
-    lý xong toàn bộ danh sách hoặc bị dừng giữa chừng - để server lưu file
-    kết quả và trả link tải về."""
-    job = _jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Phiên xử lý không tồn tại"}), 404
-    data = request.get_json(force=True) or {}
-    stopped = bool(data.get("stopped"))
-    with _jobs_lock:
-        finish_job(job, stopped)
-    return jsonify({"status": job["status"], "result_id": job.get("result_id")})
 
 
 @app.route("/api/download/<result_id>")
