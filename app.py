@@ -27,6 +27,7 @@ import webbrowser
 from datetime import timedelta
 from pathlib import Path
 
+import requests
 from flask import (Flask, jsonify, redirect, render_template, request,
                     send_file, session, url_for)
 from openpyxl import load_workbook
@@ -259,6 +260,42 @@ def clean_tax_code(raw):
 @app.route("/")
 def index():
     return render_template("index.html", show_logout=bool(APP_PASSWORD))
+
+
+@app.route("/api/test_lookup/<mst>")
+def api_test_lookup(mst):
+    """Route TẠM để kiểm tra xem SERVER (Render) có tự gọi được
+    api.xinvoice.vn hay không, sau khi phát hiện cách gọi từ trình duyệt
+    (JS fetch) chắc chắn không bao giờ hoạt động được — api.xinvoice.vn
+    không trả header access-control-allow-origin nên trình duyệt luôn chặn
+    bằng CORS, bất kể gọi bao nhiêu lần hay chờ bao lâu. Route này không
+    dùng cho luồng chính, chỉ để xác minh trước khi sửa lại kiến trúc.
+    Mở trực tiếp link dạng /api/test_lookup/<mã số thuế> trên trình duyệt để xem kết quả."""
+    try:
+        resp = requests.get(
+            API_TEMPLATE.format(tax_code=mst),
+            headers={
+                "Accept": "application/json",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                ),
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        return jsonify({"server_side_call": "exception", "detail": str(e)}), 200
+
+    content_type = resp.headers.get("Content-Type", "")
+    is_json = "json" in content_type.lower()
+    body_snippet = resp.text[:500]
+    return jsonify({
+        "server_side_call": "completed",
+        "http_status": resp.status_code,
+        "content_type": content_type,
+        "looks_like_json": is_json,
+        "body_snippet": body_snippet,
+    }), 200
 
 
 @app.route("/api/upload", methods=["POST"])
