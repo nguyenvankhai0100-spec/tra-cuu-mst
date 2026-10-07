@@ -646,9 +646,9 @@ function buildProgressTableHead() {
 function resultBadge(item) {
   switch (item.result) {
     case 'ok':
-      return '<span class="result-badge badge-ok">✓ Đã điền</span>';
+      return '<span class="result-badge badge-ok">✓ Đã điền' + (item.from_cache ? ' <small>(dùng lại kết quả đã tra)</small>' : '') + '</span>';
     case 'not_found':
-      return '<span class="result-badge badge-warn">○ Không tìm thấy</span>';
+      return '<span class="result-badge badge-warn">○ Không tìm thấy' + (item.from_cache ? ' <small>(dùng lại)</small>' : '') + '</span>';
     case 'error':
       return `<span class="result-badge badge-err">✗ Lỗi${item.detail ? ': ' + escapeHtml(item.detail) : ''}</span>`;
     case 'skipped':
