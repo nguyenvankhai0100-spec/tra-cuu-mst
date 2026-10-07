@@ -70,6 +70,57 @@ _results = {}
 _jobs = {}
 _jobs_lock = threading.Lock()
 
+# Bộ nhớ đệm CHUNG giữa mọi lần chạy (mọi người dùng, mọi file) trong cùng
+# tiến trình server: mã số thuế đã tra rồi thì lần sau dùng lại kết quả, không
+# gọi api.xinvoice.vn nữa. Chỉ lưu kết quả dứt khoát ('ok' / 'not_found'),
+# không lưu lỗi. Mỗi mục hết hạn sau MST_CACHE_TTL_HOURS giờ (mặc định 6) vì
+# trạng thái mã số thuế có thể thay đổi; đặt 0 để tắt hẳn bộ nhớ đệm. Nằm
+# trong RAM nên mất khi server khởi động lại (Render free tự ngủ/khởi động
+# lại khi lâu không dùng) - chấp nhận được, chỉ là tra lại từ đầu.
+try:
+    MST_CACHE_TTL_SECONDS = max(0.0, float(os.environ.get("MST_CACHE_TTL_HOURS", "6"))) * 3600
+except ValueError:
+    MST_CACHE_TTL_SECONDS = 6 * 3600
+MST_CACHE_MAX_ENTRIES = 50000
+_mst_cache = {}  # mst chuẩn hoá -> (hết_hạn_lúc, outcome, data)
+_mst_cache_lock = threading.Lock()
+
+
+def _cache_key(mst):
+    return str(mst).strip().upper()
+
+
+def cache_get(mst):
+    """Trả {"outcome", "data"} nếu còn hạn, ngược lại None."""
+    if MST_CACHE_TTL_SECONDS <= 0:
+        return None
+    key = _cache_key(mst)
+    now = time.time()
+    with _mst_cache_lock:
+        item = _mst_cache.get(key)
+        if item is None:
+            return None
+        expires_at, outcome, data = item
+        if expires_at <= now:
+            del _mst_cache[key]
+            return None
+        return {"outcome": outcome, "data": dict(data) if data else None}
+
+
+def cache_put(mst, outcome, data):
+    if MST_CACHE_TTL_SECONDS <= 0 or outcome not in ("ok", "not_found"):
+        return
+    now = time.time()
+    with _mst_cache_lock:
+        _mst_cache[_cache_key(mst)] = (now + MST_CACHE_TTL_SECONDS, outcome, dict(data) if data else None)
+        if len(_mst_cache) > MST_CACHE_MAX_ENTRIES:
+            for k in [k for k, v in _mst_cache.items() if v[0] <= now]:
+                del _mst_cache[k]
+            overflow = len(_mst_cache) - MST_CACHE_MAX_ENTRIES
+            if overflow > 0:
+                for k, _ in sorted(_mst_cache.items(), key=lambda kv: kv[1][0])[:overflow]:
+                    del _mst_cache[k]
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
@@ -336,7 +387,13 @@ def process_job_serverside(job_id):
     job['control']. Nếu 3 mã liên tiếp đều gặp lỗi mạng (networkFailure) -
     dấu hiệu rõ ràng là đang bị giới hạn tốc độ/chặn tạm thời, không phải
     xui từng mã lẻ tẻ - tự nghỉ hẳn 60 giây trước khi thử mã tiếp theo, thay
-    vì cứ gọi dồn dập làm tình trạng đó kéo dài thêm."""
+    vì cứ gọi dồn dập làm tình trạng đó kéo dài thêm.
+
+    Bộ nhớ đệm chung (cache_get/cache_put): mã số thuế đã tra rồi - ở dòng
+    khác của lần chạy này, hoặc ở lần chạy/file khác trước đó còn trong hạn -
+    thì dùng luôn kết quả cũ, không gọi API lần nữa (và cũng không phải chờ
+    giãn cách). Chỉ lưu kết quả dứt khoát ('ok' / 'not_found'); mã bị lỗi thì
+    KHÔNG lưu để lần sau còn được thử tra lại."""
     job = _jobs.get(job_id)
     if not job:
         return
@@ -352,6 +409,12 @@ def process_job_serverside(job_id):
 
         row = entry["row"]
         mst = entry["mst"]
+
+        cached = cache_get(mst)
+        if cached is not None:
+            with _jobs_lock:
+                apply_lookup_result(job, row, cached["outcome"], data=cached.get("data"), from_cache=True)
+            continue
 
         if consecutive_network_failures >= COOLDOWN_AFTER:
             with _jobs_lock:
@@ -370,6 +433,9 @@ def process_job_serverside(job_id):
 
         with _jobs_lock:
             apply_lookup_result(job, row, result["outcome"], data=result.get("data"), detail=result.get("detail"))
+
+        if result["outcome"] in ("ok", "not_found"):
+            cache_put(mst, result["outcome"], result.get("data"))
 
         if result.get("network_failure"):
             consecutive_network_failures += 1
@@ -463,7 +529,7 @@ def _find_row_entry(job, row):
     return None
 
 
-def apply_lookup_result(job, row, outcome, data=None, detail=None):
+def apply_lookup_result(job, row, outcome, data=None, detail=None, from_cache=False):
     """Ghi kết quả tra cứu MỘT dòng vào workbook + trạng thái job. outcome là
     'ok' / 'not_found' / 'error'. Gọi trực tiếp từ process_job_serverside
     (chạy nền trên server) sau mỗi lần lookup_mst_serverside trả về."""
@@ -478,6 +544,7 @@ def apply_lookup_result(job, row, outcome, data=None, detail=None):
     status_col = job["status_col"]
 
     row_entry.pop("wait_until", None)
+    row_entry["from_cache"] = bool(from_cache)
 
     if outcome == "ok" and data:
         if name_col:
@@ -674,7 +741,7 @@ def api_progress(job_id):
         item = {
             "row": r["row"], "mst": r["mst"], "name": r.get("name"),
             "status_val": r.get("status_val"), "result": r["result"],
-            "detail": r.get("detail"),
+            "detail": r.get("detail"), "from_cache": bool(r.get("from_cache")),
         }
         wait_until = r.get("wait_until")
         if wait_until:
