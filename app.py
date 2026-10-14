@@ -222,6 +222,34 @@ def guess_header_row(ws):
     return best_row if best_score > 0 else 1
 
 
+_MST_LIKE_RE = re.compile(r"^\d{10}(-\d{3})?$|^\d{13}$")
+
+
+def _guess_mst_col_by_content(ws, max_col, scan_rows=30):
+    """Dùng khi không khớp được tiêu đề cột nào (vd: file chỉ có đúng một cột
+    mã số thuế, không có dòng tiêu đề): chọn cột có nhiều ô trông giống mã số
+    thuế nhất (10 số, 10 số-3 số, hoặc 13 số). Trả (số_thứ_tự_cột, dòng_đầu_tiên
+    có mã) hoặc None. Chỉ là gợi ý ban đầu - người dùng vẫn chỉnh được."""
+    max_row = min(ws.max_row, scan_rows)
+    best = None  # (số ô khớp, -cột, cột, dòng đầu)
+    for c in range(1, max_col + 1):
+        matches, nonempty, first_row = 0, 0, None
+        for r in range(1, max_row + 1):
+            v = ws.cell(row=r, column=c).value
+            if v in (None, ""):
+                continue
+            nonempty += 1
+            if _MST_LIKE_RE.match(clean_tax_code(v)):
+                matches += 1
+                if first_row is None:
+                    first_row = r
+        if matches and matches / nonempty >= 0.6:
+            cand = (matches, -c, c, first_row)
+            if best is None or cand > best:
+                best = cand
+    return (best[2], best[3]) if best else None
+
+
 def guess_mapping(ws):
     header_row = guess_header_row(ws)
     max_col = min(ws.max_column, 500)
@@ -247,6 +275,18 @@ def guess_mapping(ws):
             used_cols.add(found_col)
         else:
             assigned[field] = None
+
+    # Không khớp được tiêu đề nào (file không có dòng tiêu đề, vd: chỉ một cột
+    # mã số thuế trơn) -> đoán cột MST theo nội dung ô, và coi dòng có mã đầu
+    # tiên là dòng bắt đầu dữ liệu (không có dòng tiêu đề để bỏ qua).
+    if not any(assigned.get(f) for f in FIELD_KEYWORDS):
+        guess = _guess_mst_col_by_content(ws, max_col)
+        if guess:
+            col_idx, first_row = guess
+            assigned["mst_col"] = get_column_letter(col_idx)
+            assigned["header_row"] = first_row - 1 if first_row > 1 else None
+            assigned["start_row"] = first_row
+            return assigned
 
     # Đoán dòng bắt đầu dữ liệu = dòng đầu tiên sau header_row có ô ở cột MST khác rỗng
     start_row = header_row + 1
@@ -642,6 +682,22 @@ def api_process():
     target_cols = [c for c in (name_col, address_col, dept_col, status_col) if c]
     if not target_cols:
         return jsonify({"error": "Bạn cần chọn ít nhất 1 cột để điền kết quả"}), 400
+
+    # Cột có thể do người dùng tự gõ (mục "Cột khác") nên phải kiểm tra hợp lệ,
+    # và không cho hai mục dùng chung một cột - nhất là ghi đè lên cột MST.
+    labelled = [("Mã số thuế", mst_col), ("Tên người nộp thuế", name_col),
+                ("Địa chỉ", address_col), ("Cơ quan quản lý thuế", dept_col),
+                ("Trạng thái MST", status_col)]
+    for label, col in labelled:
+        if col and not (re.fullmatch(r"[A-Z]{1,3}", col) and column_index_from_string(col) <= 16384):
+            return jsonify({"error": f"Tên cột \"{col}\" (mục {label}) không hợp lệ - chỉ nhập chữ cột như A, B, … Z, AA, AB…"}), 400
+    seen = {}
+    for label, col in labelled:
+        if not col:
+            continue
+        if col in seen:
+            return jsonify({"error": f"Cột {col} đang bị dùng cho cả \"{seen[col]}\" và \"{label}\" - mỗi mục cần một cột riêng (nếu không dữ liệu sẽ bị ghi đè)."}), 400
+        seen[col] = label
 
     path = _uploads[upload_id]["path"]
     wb = load_workbook(path)
