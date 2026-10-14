@@ -70,7 +70,7 @@
     gap: 14px;
   }
   label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-  select, input[type=number] {
+  select, input[type=number], input.col-custom {
     width: 100%;
     padding: 7px 8px;
     border: 1px solid var(--border);
@@ -78,6 +78,7 @@
     font-size: 13px;
     background: #fff;
   }
+  input.col-custom { margin-top: 6px; border-color: #2f6fed; text-transform: uppercase; }
   table.preview {
     border-collapse: collapse;
     width: 100%;
@@ -341,9 +342,14 @@
         <select id="statusCol"></select>
       </div>
     </div>
+    <div class="hint" style="margin:-6px 0 14px;">
+      File không có tiêu đề, hoặc cột bạn muốn điền kết quả đang trống nên không có trong danh sách?
+      Chọn <b>✏ Cột khác (tự nhập)…</b> ở cuối danh sách rồi gõ tên cột (A, B, C… hoặc AA, AB…) —
+      kết quả sẽ được điền vào đúng cột đó. Lưu ý: không chọn trùng cột đang chứa mã số thuế.
+    </div>
 
     <div class="hint" style="margin-bottom:8px;">
-      Xem trước dữ liệu (tối đa 12 dòng đầu, 12 cột đầu) — dòng tiêu đề tôi đoán được tô đậm hàng đầu bảng:
+      Xem trước dữ liệu (tối đa 12 dòng đầu, từ cột A tới cột cuối cùng có dữ liệu) — dòng tiêu đề tôi đoán được tô đậm hàng đầu bảng:
     </div>
     <table class="preview" id="previewTable"></table>
 
@@ -433,6 +439,41 @@ const colSelects = {
   status_col: document.getElementById('statusCol'),
 };
 
+// Mục "✏ Cột khác (tự nhập)…": cho chọn một cột không có trong danh sách (vd:
+// file không có tiêu đề, hoặc cột trống chưa có dữ liệu để điền kết quả vào).
+const CUSTOM_COL = '__custom__';
+const COL_LABELS = {
+  mst_col: 'Cột chứa Mã số thuế', name_col: 'Cột điền Tên người nộp thuế',
+  address_col: 'Cột điền Địa chỉ', dept_col: 'Cột điền Cơ quan quản lý thuế',
+  status_col: 'Cột điền Trạng thái MST',
+};
+const customInputs = {};
+for (const field of Object.keys(colSelects)) {
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.className = 'col-custom hidden';
+  inp.maxLength = 3;
+  inp.placeholder = 'Gõ tên cột, vd: D';
+  inp.autocomplete = 'off';
+  inp.addEventListener('input', () => { inp.value = inp.value.toUpperCase().replace(/[^A-Z]/g, ''); });
+  colSelects[field].insertAdjacentElement('afterend', inp);
+  customInputs[field] = inp;
+  colSelects[field].addEventListener('change', () => syncCustomInput(field, true));
+}
+
+function syncCustomInput(field, focus) {
+  const show = colSelects[field].value === CUSTOM_COL;
+  customInputs[field].classList.toggle('hidden', !show);
+  if (show && focus) customInputs[field].focus();
+}
+
+// Giá trị cột thật sự cần gửi đi: chữ cột đã chọn, hoặc chữ cột người dùng tự gõ.
+function getColValue(field) {
+  const v = colSelects[field].value;
+  if (v !== CUSTOM_COL) return v;
+  return customInputs[field].value.trim().toUpperCase();
+}
+
 dropZone.addEventListener('click', () => fileInput.click());
 dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag'); });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag'));
@@ -500,16 +541,20 @@ function colLetterOptions(letters, headerRowVals, selectedLetter) {
     const sel = (L === selectedLetter) ? 'selected' : '';
     html += `<option value="${L}" ${sel}>${label}</option>`;
   });
+  html += `<option value="${CUSTOM_COL}">✏ Cột khác (tự nhập)…</option>`;
   return html;
 }
 
 function applyMappingResult(mapping, preview) {
   const letters = preview.columns;
-  const headerRowIdx = (mapping.header_row || 1) - 1;
-  const headerVals = preview.rows[headerRowIdx] || [];
+  // header_row = null: file không có dòng tiêu đề (dữ liệu bắt đầu ngay từ dòng 1).
+  const headerRowIdx = mapping.header_row ? mapping.header_row - 1 : -1;
+  const headerVals = headerRowIdx >= 0 ? (preview.rows[headerRowIdx] || []) : [];
 
   for (const field of Object.keys(colSelects)) {
     colSelects[field].innerHTML = colLetterOptions(letters, headerVals, mapping[field]);
+    customInputs[field].value = '';
+    syncCustomInput(field, false);
   }
   startRowInput.value = mapping.start_row || 3;
 
@@ -542,13 +587,20 @@ runBtn.addEventListener('click', async () => {
     start_row: parseInt(startRowInput.value, 10),
     delay: parseFloat(delayInput.value),
     skip_filled: skipFilledInput.checked,
-    mst_col: colSelects.mst_col.value,
-    name_col: colSelects.name_col.value,
-    address_col: colSelects.address_col.value,
-    dept_col: colSelects.dept_col.value,
-    status_col: colSelects.status_col.value,
+    mst_col: getColValue('mst_col'),
+    name_col: getColValue('name_col'),
+    address_col: getColValue('address_col'),
+    dept_col: getColValue('dept_col'),
+    status_col: getColValue('status_col'),
   };
 
+  for (const field of Object.keys(colSelects)) {
+    if (colSelects[field].value === CUSTOM_COL && !payload[field]) {
+      alert(`Mục "${COL_LABELS[field]}" đang chọn "Cột khác" nhưng bạn chưa gõ tên cột (vd: D).`);
+      customInputs[field].focus();
+      return;
+    }
+  }
   if (!payload.mst_col) { alert('Bạn cần chọn cột chứa Mã số thuế'); return; }
 
   runBtn.disabled = true;
