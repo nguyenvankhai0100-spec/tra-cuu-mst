@@ -335,13 +335,42 @@ def build_preview(ws):
 # Gọi API tra cứu MST
 # ---------------------------------------------------------------------------
 
+_DASHES = "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE63\uFF0D"
+_INVISIBLE_RE = re.compile(r"[\s\u00a0\u200b\u200c\u200d\u2060\ufeff]+")
+
+
 def clean_tax_code(raw):
+    """Chuẩn hóa MST đọc từ Excel về dạng API hiểu: bỏ khoảng trắng/ký tự vô
+    hình, đổi các loại gạch nối lạ (– — ‑ ...) thành '-', và MST viết liền 13
+    số (vd 0109248714001) thì tách thành 0109248714-001. API xinvoice trả
+    'không tìm thấy' nếu gặp các dạng viết lệch này."""
     if raw is None:
         return ""
     s = str(raw).strip()
     if s.endswith(".0") and s[:-2].replace("-", "").isdigit():
         s = s[:-2]
+    for ch in _DASHES:
+        s = s.replace(ch, "-")
+    s = _INVISIBLE_RE.sub("", s)
+    if re.fullmatch(r"\d{13}", s):
+        s = s[:10] + "-" + s[10:]
     return s
+
+
+def _digits(s):
+    return re.sub(r"\D", "", str(s or ""))
+
+
+def pick_matching_record(records, mst):
+    """API trả về MỘT DANH SÁCH: tra MST 10 số sẽ ra cả công ty mẹ lẫn các
+    chi nhánh (chi nhánh có thể nằm đầu danh sách). Chỉ lấy bản ghi có taxID
+    đúng bằng MST đang tra; không khớp bản nào thì coi như không tìm thấy
+    (tuyệt đối không lấy bừa phần tử đầu)."""
+    want = _digits(mst)
+    for rec in records or []:
+        if isinstance(rec, dict) and _digits(rec.get("taxID")) == want:
+            return rec
+    return None
 
 
 _LOOKUP_HEADERS = {
@@ -389,7 +418,9 @@ def lookup_mst_serverside(mst, on_wait=None):
                 time.sleep(wait_s)
                 continue
             if payload and payload.get("success") and payload.get("data"):
-                return {"outcome": "ok", "data": payload["data"][0]}
+                rec = pick_matching_record(payload["data"], mst)
+                if rec is not None:
+                    return {"outcome": "ok", "data": rec}
             return {"outcome": "not_found"}
 
         if resp.status_code == 404:
